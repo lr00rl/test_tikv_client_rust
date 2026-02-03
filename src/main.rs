@@ -1,5 +1,5 @@
 use std::env;
-use tikv_client::TransactionClient;
+use tikv_client::RawClient;
 
 #[tokio::main]
 async fn main() {
@@ -10,49 +10,59 @@ async fn main() {
         std::process::exit(1);
     }
 
-    println!("=== TiKV Scan Test ===");
+    println!("=== TiKV Scan Test (RawClient) ===");
     println!("PD endpoints: {:?}\n", pd_endpoints);
 
-    let txn_client = TransactionClient::new(pd_endpoints)
+    println!("Connecting to TiKV cluster...");
+    let client = RawClient::new(pd_endpoints)
         .await
-        .expect("failed to connect to PD");
+        .expect("failed to connect");
 
-    let mut txn = txn_client
-        .begin_optimistic()
-        .await
-        .expect("failed to begin txn");
+    println!("Connected successfully!\n");
 
-    // Scan the first 20 keys starting from the beginning
-    // TiDB table data keys start with 't' (0x74), meta keys start with 'm' (0x6d)
-    let start: Vec<u8> = vec![0x74]; // 't' prefix - table data region
-    let end: Vec<u8> = vec![0x75];   // just past 't'
+    // Scan first 20 keys starting from 't' prefix (table data)
+    let start_key = vec![b't'];
+    let end_key = vec![b'u']; // just after 't'
+    println!("Scanning 20 keys from range [t..u)...");
 
-    match txn.scan(start..end, 20).await {
+    match client.scan(start_key..end_key, 20).await {
         Ok(pairs) => {
-            let pairs: Vec<_> = pairs.collect();
             println!("Found {} key-value pairs:\n", pairs.len());
-            for (i, pair) in pairs.iter().enumerate() {
-                let key_bytes: Vec<u8> = pair.0.clone().into();
-                let val_bytes: &[u8] = &pair.1;
 
-                println!("--- [{i}] ---");
-                println!("  key hex:   {}", hex(&key_bytes));
-                println!("  key bytes: {:?}", key_bytes);
-                println!("  val hex:   {}", hex(val_bytes));
-                // Try to show as UTF-8 if possible
+            for (i, kv) in pairs.iter().enumerate() {
+                let key_bytes: Vec<u8> = kv.0.clone().into();
+                let val_bytes: &[u8] = &kv.1;
+
+                println!("--- [{}] ---", i);
+                println!("  key (hex):  {}", bytes_to_hex(&key_bytes));
+                println!("  key (raw):  {:?}", key_bytes);
+                println!("  val (hex):  {}", bytes_to_hex(val_bytes));
+                println!("  val (len):  {} bytes", val_bytes.len());
+
+                // Try to show value as UTF-8 if possible (truncate if too long)
                 if let Ok(s) = std::str::from_utf8(val_bytes) {
-                    println!("  val utf8:  {s}");
+                    let display = if s.len() > 100 {
+                        format!("{}... (truncated)", &s[..100])
+                    } else {
+                        s.to_string()
+                    };
+                    println!("  val (utf8): {}", display);
                 }
                 println!();
             }
         }
-        Err(e) => eprintln!("scan error: {e}"),
+        Err(e) => {
+            eprintln!("Scan failed: {}", e);
+            std::process::exit(1);
+        }
     }
 
-    let _ = txn.commit().await;
     println!("=== Done ===");
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
