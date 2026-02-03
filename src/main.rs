@@ -36,6 +36,7 @@ async fn main() {
                 println!("--- [{}] ---", i);
                 println!("  key (hex):  {}", bytes_to_hex(&key_bytes));
                 println!("  key (raw):  {:?}", key_bytes);
+                println!("  key (tidb): {}", decode_tidb_key(&key_bytes));
                 println!("  val (hex):  {}", bytes_to_hex(val_bytes));
                 println!("  val (len):  {} bytes", val_bytes.len());
 
@@ -65,6 +66,53 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Decode TiDB key encoding:
+///   table record: 't' + table_id(8B) + '_r' + row_id(8B)
+///   table index:  't' + table_id(8B) + '_i' + index_id(8B) + ...
+/// Integers are big-endian with sign bit flipped (XOR 0x80 on first byte).
+fn decode_tidb_key(key: &[u8]) -> String {
+    if key.is_empty() || key[0] != b't' {
+        return "not a table key".to_string();
+    }
+    if key.len() < 9 {
+        return format!("table key too short ({} bytes)", key.len());
+    }
+
+    let table_id = decode_i64(&key[1..9]);
+
+    if key.len() < 11 {
+        return format!("table_id={}", table_id);
+    }
+
+    let tag = &key[9..11];
+    match tag {
+        b"_r" => {
+            if key.len() >= 19 {
+                let row_id = decode_i64(&key[11..19]);
+                format!("table_id={}, record row_id={}", table_id, row_id)
+            } else {
+                format!("table_id={}, record (row_id truncated)", table_id)
+            }
+        }
+        b"_i" => {
+            if key.len() >= 19 {
+                let index_id = decode_i64(&key[11..19]);
+                format!("table_id={}, index_id={}", table_id, index_id)
+            } else {
+                format!("table_id={}, index (index_id truncated)", table_id)
+            }
+        }
+        _ => format!("table_id={}, unknown tag {:02x}{:02x}", table_id, tag[0], tag[1]),
+    }
+}
+
+fn decode_i64(bytes: &[u8]) -> i64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    buf[0] ^= 0x80; // flip sign bit
+    i64::from_be_bytes(buf)
 }
 
 
