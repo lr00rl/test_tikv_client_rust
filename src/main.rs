@@ -10,6 +10,7 @@ async fn main() {
     let mut table_id_filter: Option<i64> = None;
     let mut limit: u32 = 20;
     let mut use_txn = false;
+    let mut record_type: Option<String> = None; // "record", "index", or None (all)
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -24,14 +25,18 @@ async fn main() {
             "--txn" => {
                 use_txn = true;
             }
+            "--type" => {
+                i += 1;
+                record_type = Some(args[i].clone());
+            }
             _ => pd_endpoints.push(args[i].clone()),
         }
         i += 1;
     }
 
     if pd_endpoints.is_empty() {
-        eprintln!("Usage: test_tikv_client <pd_addr> [--table-id <ID>] [--limit <N>] [--txn]");
-        eprintln!("Example: test_tikv_client 10.0.12.184:2379 --table-id 11875 --limit 5 --txn");
+        eprintln!("Usage: test_tikv_client <pd_addr> [--table-id <ID>] [--limit <N>] [--txn] [--type record|index]");
+        eprintln!("Example: test_tikv_client 10.0.12.184:2379 --table-id 11875 --limit 5 --txn --type record");
         std::process::exit(1);
     }
 
@@ -40,6 +45,9 @@ async fn main() {
     println!("PD endpoints: {:?}", pd_endpoints);
     if let Some(tid) = table_id_filter {
         println!("Filter: table_id={}", tid);
+    }
+    if let Some(ref t) = record_type {
+        println!("Type filter: {}", t);
     }
     println!("Limit: {}\n", limit);
 
@@ -52,12 +60,33 @@ async fn main() {
             // TransactionClient: use logical key (no memcomparable)
             let mut start = vec![b't'];
             start.extend_from_slice(&encode_i64(tid));
+
+            // Apply --type filter on key range
+            if let Some(ref t) = record_type {
+                match t.as_str() {
+                    "record" => start.extend_from_slice(b"_r"),
+                    "index" => start.extend_from_slice(b"_i"),
+                    _ => {}
+                }
+            }
+
             let mut end = vec![b't'];
             end.extend_from_slice(&encode_i64(tid + 1));
             (start, end, format!("table_id={}", tid))
         } else {
             // RawClient: use memcomparable-encoded key
-            (encode_table_prefix(tid), encode_table_prefix(tid + 1), format!("table_id={}", tid))
+            let mut start_logical = vec![b't'];
+            start_logical.extend_from_slice(&encode_i64(tid));
+
+            if let Some(ref t) = record_type {
+                match t.as_str() {
+                    "record" => start_logical.extend_from_slice(b"_r"),
+                    "index" => start_logical.extend_from_slice(b"_i"),
+                    _ => {}
+                }
+            }
+
+            (encode_memcomparable_bytes(&start_logical), encode_table_prefix(tid + 1), format!("table_id={}", tid))
         }
     } else {
         (vec![b't'], vec![b'u'], "all tables".to_string())
@@ -124,21 +153,83 @@ async fn main() {
 fn print_kv(i: usize, key_bytes: &[u8], val_bytes: &[u8], raw_mode: bool) {
     println!("--- [{}] ---", i);
     println!("  key (hex):  {}", bytes_to_hex(key_bytes));
-    if raw_mode {
-        // RawClient returns memcomparable-encoded keys with MVCC suffix
-        println!("  key (tidb): {}", decode_tidb_key(key_bytes));
+
+    let decoded_key = if raw_mode {
+        decode_tidb_key_detailed(key_bytes)
     } else {
-        // TransactionClient returns logical keys directly
-        println!("  key (tidb): {}", decode_logical_key(key_bytes));
-    }
+        decode_logical_key_detailed(key_bytes)
+    };
+
+    println!("  {}", decoded_key);
+
     println!("  val (hex):  {}", bytes_to_hex(val_bytes));
     println!("  val (len):  {} bytes", val_bytes.len());
+
+    // Decode value if it's an index entry
+    if !key_bytes.is_empty() && is_index_key(key_bytes, raw_mode) {
+        decode_index_value(val_bytes);
+    }
 
     let readable = extract_ascii_strings(val_bytes, 4);
     if !readable.is_empty() {
         println!("  val (strings): {}", readable.join(" | "));
     }
     println!();
+}
+
+/// Determine if key is an index key (_i) vs record key (_r).
+fn is_index_key(key: &[u8], raw_mode: bool) -> bool {
+    if raw_mode {
+        let (decoded, _) = decode_memcomparable_bytes(key);
+        decoded.len() >= 11 && decoded[0] == b't' && &decoded[9..11] == b"_i"
+    } else {
+        key.len() >= 11 && key[0] == b't' && &key[9..11] == b"_i"
+    }
+}
+
+/// Decode a logical TiDB key with detailed field parsing.
+fn decode_logical_key_detailed(key: &[u8]) -> String {
+    if key.is_empty() || key[0] != b't' {
+        return format!("key (tidb): not a table key");
+    }
+    if key.len() < 9 {
+        return format!("key (tidb): table key too short ({} bytes)", key.len());
+    }
+
+    let table_id = decode_i64(&key[1..9]);
+
+    if key.len() < 11 {
+        return format!("key (tidb): table_id={}", table_id);
+    }
+
+    let tag = &key[9..11];
+    match tag {
+        b"_r" => {
+            if key.len() >= 19 {
+                let row_id = decode_i64(&key[11..19]);
+                format!("key (tidb): table_id={}, record, row_id={}", table_id, row_id)
+            } else {
+                format!("key (tidb): table_id={}, record (row_id truncated)", table_id)
+            }
+        }
+        b"_i" => {
+            if key.len() >= 19 {
+                let index_id = decode_i64(&key[11..19]);
+                let mut result = format!("key (tidb): table_id={}, index_id={}", table_id, index_id);
+
+                // Try to decode index column values
+                if key.len() > 19 {
+                    let index_data = &key[19..];
+                    result.push_str("\n  key (index): ");
+                    result.push_str(&decode_index_columns(index_data));
+                }
+                result
+            } else {
+                format!("key (tidb): table_id={}, index (index_id truncated)", table_id)
+            }
+        }
+        _ => format!("key (tidb): table_id={}, unknown tag {:02x}{:02x}", table_id, tag[0], tag[1]),
+    }
 }
 
 /// Decode a logical TiDB key (no memcomparable encoding, as returned by TransactionClient).
@@ -211,6 +302,59 @@ fn decode_memcomparable_bytes(encoded: &[u8]) -> (Vec<u8>, usize) {
         }
     }
     (decoded, pos)
+}
+
+/// Decode TiDB key with detailed parsing (includes memcomparable layer).
+fn decode_tidb_key_detailed(raw_key: &[u8]) -> String {
+    let (key, consumed) = decode_memcomparable_bytes(raw_key);
+    let remaining = raw_key.len() - consumed;
+
+    if key.is_empty() || key[0] != b't' {
+        return "key (tidb): not a table key".to_string();
+    }
+    if key.len() < 9 {
+        return format!("key (tidb): table key too short ({} decoded bytes)", key.len());
+    }
+
+    let table_id = decode_i64(&key[1..9]);
+
+    if key.len() < 11 {
+        return format!("key (tidb): table_id={}", table_id);
+    }
+
+    let tag = &key[9..11];
+    let suffix = if remaining > 0 {
+        format!(" (+ {} bytes mvcc)", remaining)
+    } else {
+        String::new()
+    };
+
+    match tag {
+        b"_r" => {
+            if key.len() >= 19 {
+                let row_id = decode_i64(&key[11..19]);
+                format!("key (tidb): table_id={}, record, row_id={}{}", table_id, row_id, suffix)
+            } else {
+                format!("key (tidb): table_id={}, record (row_id truncated){}", table_id, suffix)
+            }
+        }
+        b"_i" => {
+            if key.len() >= 19 {
+                let index_id = decode_i64(&key[11..19]);
+                let mut result = format!("key (tidb): table_id={}, index_id={}{}", table_id, index_id, suffix);
+
+                if key.len() > 19 {
+                    let index_data = &key[19..];
+                    result.push_str("\n  key (index): ");
+                    result.push_str(&decode_index_columns(index_data));
+                }
+                result
+            } else {
+                format!("key (tidb): table_id={}, index (index_id truncated){}", table_id, suffix)
+            }
+        }
+        _ => format!("key (tidb): table_id={}, unknown tag {:02x}{:02x}{}", table_id, tag[0], tag[1], suffix),
+    }
 }
 
 /// Decode TiDB key encoding (with memcomparable layer):
@@ -305,6 +449,128 @@ fn decode_i64(bytes: &[u8]) -> i64 {
     buf.copy_from_slice(&bytes[..8]);
     buf[0] ^= 0x80; // flip sign bit
     i64::from_be_bytes(buf)
+}
+
+/// Decode index columns from the key data after table_id + _i + index_id.
+/// This is a best-effort decode showing field types and raw values.
+fn decode_index_columns(data: &[u8]) -> String {
+    let mut result = Vec::new();
+    let mut pos = 0;
+
+    while pos < data.len() {
+        if pos + 1 > data.len() {
+            break;
+        }
+
+        let type_flag = data[pos];
+        pos += 1;
+
+        match type_flag {
+            // Int (positive): 0x03 + 8 bytes
+            0x03 => {
+                if pos + 8 <= data.len() {
+                    let val = decode_i64(&data[pos..pos + 8]);
+                    result.push(format!("int={}", val));
+                    pos += 8;
+                } else {
+                    result.push("int=<truncated>".to_string());
+                    break;
+                }
+            }
+            // Bytes/String: 0x01 + data + 0xff markers
+            0x01 => {
+                let _start = pos;
+                let mut decoded = Vec::new();
+                loop {
+                    if pos + 9 > data.len() {
+                        break;
+                    }
+                    let group = &data[pos..pos + 8];
+                    let marker = data[pos + 8];
+                    pos += 9;
+
+                    if marker == 0xff {
+                        decoded.extend_from_slice(group);
+                    } else {
+                        let pad = (0xff - marker) as usize;
+                        if pad <= 8 {
+                            decoded.extend_from_slice(&group[..8 - pad]);
+                        }
+                        break;
+                    }
+                }
+                if let Ok(s) = String::from_utf8(decoded.clone()) {
+                    result.push(format!("str=\"{}\"", s));
+                } else {
+                    result.push(format!("bytes=<{} bytes>", decoded.len()));
+                }
+            }
+            _ => {
+                result.push(format!("unknown_type=0x{:02x}", type_flag));
+                break;
+            }
+        }
+    }
+
+    if result.is_empty() {
+        format!("<{} bytes>", data.len())
+    } else {
+        result.join(", ")
+    }
+}
+
+/// Decode index value to extract handle (_tidb_rowid) and restore data.
+/// Index value format (simplified):
+///   - For unique index: [version_info] + handle + [restore_data]
+fn decode_index_value(val: &[u8]) {
+    if val.is_empty() {
+        return;
+    }
+
+    // Try to extract handle from the end (common handle is usually last 8 bytes for int handle)
+    if val.len() >= 8 {
+        // The handle is often encoded after some prefix bytes.
+        // In TiDB's new collation format, there's usually a version byte, then restore data, then handle.
+        // Let's try to find int64-like patterns (8 consecutive bytes that decode to reasonable values).
+
+        // Common pattern: first byte is length/version, then comes data
+        let _first_byte = val[0];
+
+        // Try to decode handle from different positions
+        let mut handle_candidates = Vec::new();
+
+        // Try position after first byte
+        if val.len() >= 9 {
+            let h = decode_i64(&val[1..9]);
+            if h > 0 && h < 1_000_000_000 {
+                handle_candidates.push((1, h));
+            }
+        }
+
+        // Try last 8 bytes
+        if val.len() >= 8 {
+            let offset = val.len() - 8;
+            let h = decode_i64(&val[offset..]);
+            if h > 0 && h < 1_000_000_000 {
+                handle_candidates.push((offset, h));
+            }
+        }
+
+        // Try position at offset 9 (common in newer format)
+        if val.len() >= 17 {
+            let h = decode_i64(&val[9..17]);
+            if h > 0 && h < 1_000_000_000 {
+                handle_candidates.push((9, h));
+            }
+        }
+
+        if !handle_candidates.is_empty() {
+            println!("  val (parsed): handle_candidates={:?}", handle_candidates);
+            if let Some((offset, h)) = handle_candidates.first() {
+                println!("  val (handle): _tidb_rowid={} (at offset {})", h, offset);
+            }
+        }
+    }
 }
 
 /// Extract printable ASCII strings (min_len or longer) from binary data.
