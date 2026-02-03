@@ -40,14 +40,10 @@ async fn main() {
                 println!("  val (hex):  {}", bytes_to_hex(val_bytes));
                 println!("  val (len):  {} bytes", val_bytes.len());
 
-                // Try to show value as UTF-8 if possible (truncate if too long)
-                if let Ok(s) = std::str::from_utf8(val_bytes) {
-                    let display = if s.len() > 100 {
-                        format!("{}... (truncated)", &s[..100])
-                    } else {
-                        s.to_string()
-                    };
-                    println!("  val (utf8): {}", display);
+                // Show readable ASCII strings found in value
+                let readable = extract_ascii_strings(val_bytes, 4);
+                if !readable.is_empty() {
+                    println!("  val (strings): {}", readable.join(" | "));
                 }
                 println!();
             }
@@ -68,16 +64,48 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-/// Decode TiDB key encoding:
+/// Decode memcomparable bytes encoding used by TiKV.
+/// Every 8 data bytes are followed by 1 marker byte:
+///   0xff = all 8 bytes valid, more groups follow
+///   0xff - N = last group, only (8-N) bytes are real data
+fn decode_memcomparable_bytes(encoded: &[u8]) -> (Vec<u8>, usize) {
+    let mut decoded = Vec::new();
+    let mut pos = 0;
+    loop {
+        if pos + 9 > encoded.len() {
+            break;
+        }
+        let group = &encoded[pos..pos + 8];
+        let marker = encoded[pos + 8];
+        pos += 9;
+
+        if marker == 0xff {
+            decoded.extend_from_slice(group);
+        } else {
+            let pad_count = (0xff - marker) as usize;
+            if pad_count <= 8 {
+                decoded.extend_from_slice(&group[..8 - pad_count]);
+            }
+            break;
+        }
+    }
+    (decoded, pos)
+}
+
+/// Decode TiDB key encoding (with memcomparable layer):
 ///   table record: 't' + table_id(8B) + '_r' + row_id(8B)
 ///   table index:  't' + table_id(8B) + '_i' + index_id(8B) + ...
 /// Integers are big-endian with sign bit flipped (XOR 0x80 on first byte).
-fn decode_tidb_key(key: &[u8]) -> String {
+fn decode_tidb_key(raw_key: &[u8]) -> String {
+    // Step 1: strip memcomparable encoding
+    let (key, consumed) = decode_memcomparable_bytes(raw_key);
+    let remaining = raw_key.len() - consumed;
+
     if key.is_empty() || key[0] != b't' {
         return "not a table key".to_string();
     }
     if key.len() < 9 {
-        return format!("table key too short ({} bytes)", key.len());
+        return format!("table key too short ({} decoded bytes)", key.len());
     }
 
     let table_id = decode_i64(&key[1..9]);
@@ -87,24 +115,30 @@ fn decode_tidb_key(key: &[u8]) -> String {
     }
 
     let tag = &key[9..11];
+    let suffix = if remaining > 0 {
+        format!(" (+ {} bytes mvcc ver)", remaining)
+    } else {
+        String::new()
+    };
+
     match tag {
         b"_r" => {
             if key.len() >= 19 {
                 let row_id = decode_i64(&key[11..19]);
-                format!("table_id={}, record row_id={}", table_id, row_id)
+                format!("table_id={}, record row_id={}{}", table_id, row_id, suffix)
             } else {
-                format!("table_id={}, record (row_id truncated)", table_id)
+                format!("table_id={}, record (row_id truncated){}", table_id, suffix)
             }
         }
         b"_i" => {
             if key.len() >= 19 {
                 let index_id = decode_i64(&key[11..19]);
-                format!("table_id={}, index_id={}", table_id, index_id)
+                format!("table_id={}, index_id={}{}", table_id, index_id, suffix)
             } else {
-                format!("table_id={}, index (index_id truncated)", table_id)
+                format!("table_id={}, index (index_id truncated){}", table_id, suffix)
             }
         }
-        _ => format!("table_id={}, unknown tag {:02x}{:02x}", table_id, tag[0], tag[1]),
+        _ => format!("table_id={}, unknown tag {:02x}{:02x}{}", table_id, tag[0], tag[1], suffix),
     }
 }
 
@@ -113,6 +147,26 @@ fn decode_i64(bytes: &[u8]) -> i64 {
     buf.copy_from_slice(&bytes[..8]);
     buf[0] ^= 0x80; // flip sign bit
     i64::from_be_bytes(buf)
+}
+
+/// Extract printable ASCII strings (min_len or longer) from binary data.
+fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<String> {
+    let mut strings = Vec::new();
+    let mut current = String::new();
+    for &b in data {
+        if b >= 0x20 && b < 0x7f {
+            current.push(b as char);
+        } else {
+            if current.len() >= min_len {
+                strings.push(current.clone());
+            }
+            current.clear();
+        }
+    }
+    if current.len() >= min_len {
+        strings.push(current);
+    }
+    strings
 }
 
 
