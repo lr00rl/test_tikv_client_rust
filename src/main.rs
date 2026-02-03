@@ -66,3 +66,6 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+
+// timeout 10 ./target/debug/test_tikv_client 10.0.12.184:2379
