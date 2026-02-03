@@ -1,0 +1,8 @@
+[package]
+name = "test_tikv_client"
+version = "0.1.0"
+edition = "2024"  # cargo version, not 2026 yet
+
+[dependencies]
+tikv-client = "0.3"
+tokio = { version = "1", features = ["full"] }
