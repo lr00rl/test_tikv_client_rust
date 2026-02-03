@@ -3,15 +3,40 @@ use tikv_client::RawClient;
 
 #[tokio::main]
 async fn main() {
-    let pd_endpoints: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    // Parse optional --table-id and --limit flags
+    let mut pd_endpoints = Vec::new();
+    let mut table_id_filter: Option<i64> = None;
+    let mut limit: u32 = 20;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--table-id" => {
+                i += 1;
+                table_id_filter = Some(args[i].parse().expect("--table-id must be a number"));
+            }
+            "--limit" => {
+                i += 1;
+                limit = args[i].parse().expect("--limit must be a number");
+            }
+            _ => pd_endpoints.push(args[i].clone()),
+        }
+        i += 1;
+    }
+
     if pd_endpoints.is_empty() {
-        eprintln!("Usage: test_tikv_client <pd_addr1> [pd_addr2 ...]");
-        eprintln!("Example: test_tikv_client 127.0.0.1:2379");
+        eprintln!("Usage: test_tikv_client <pd_addr> [--table-id <ID>] [--limit <N>]");
+        eprintln!("Example: test_tikv_client 10.0.12.184:2379 --table-id 11874 --limit 20");
         std::process::exit(1);
     }
 
     println!("=== TiKV Scan Test (RawClient) ===");
-    println!("PD endpoints: {:?}\n", pd_endpoints);
+    println!("PD endpoints: {:?}", pd_endpoints);
+    if let Some(tid) = table_id_filter {
+        println!("Filter: table_id={}", tid);
+    }
+    println!("Limit: {}\n", limit);
 
     println!("Connecting to TiKV cluster...");
     let client = RawClient::new(pd_endpoints)
@@ -20,12 +45,15 @@ async fn main() {
 
     println!("Connected successfully!\n");
 
-    // Scan first 20 keys starting from 't' prefix (table data)
-    let start_key = vec![b't'];
-    let end_key = vec![b'u']; // just after 't'
-    println!("Scanning 20 keys from range [t..u)...");
+    // Build scan range
+    let (start_key, end_key, range_desc) = if let Some(tid) = table_id_filter {
+        (encode_table_prefix(tid), encode_table_prefix(tid + 1), format!("table_id={}", tid))
+    } else {
+        (vec![b't'], vec![b'u'], "all tables".to_string())
+    };
+    println!("Scanning {} keys for [{}]...", limit, range_desc);
 
-    match client.scan(start_key..end_key, 20).await {
+    match client.scan(start_key..end_key, limit).await {
         Ok(pairs) => {
             println!("Found {} key-value pairs:\n", pairs.len());
 
@@ -140,6 +168,43 @@ fn decode_tidb_key(raw_key: &[u8]) -> String {
         }
         _ => format!("table_id={}, unknown tag {:02x}{:02x}{}", table_id, tag[0], tag[1], suffix),
     }
+}
+
+/// Encode a table prefix key: 't' + table_id, with memcomparable bytes encoding.
+/// This produces the start key for scanning a specific table.
+fn encode_table_prefix(table_id: i64) -> Vec<u8> {
+    // Logical key: 't' (1 byte) + encoded table_id (8 bytes) = 9 bytes
+    let mut logical = vec![b't'];
+    logical.extend_from_slice(&encode_i64(table_id));
+
+    // Memcomparable encode: 9 bytes → group1 (8 data + 0xff) + group2 (1 data + 7 padding + 0xf8)
+    encode_memcomparable_bytes(&logical)
+}
+
+fn encode_i64(val: i64) -> [u8; 8] {
+    let mut buf = val.to_be_bytes();
+    buf[0] ^= 0x80;
+    buf
+}
+
+fn encode_memcomparable_bytes(data: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    let mut pos = 0;
+    loop {
+        let remaining = data.len() - pos;
+        if remaining >= 8 {
+            encoded.extend_from_slice(&data[pos..pos + 8]);
+            encoded.push(0xff);
+            pos += 8;
+        } else {
+            let mut group = [0u8; 8];
+            group[..remaining].copy_from_slice(&data[pos..]);
+            encoded.extend_from_slice(&group);
+            encoded.push(0xff - (8 - remaining) as u8);
+            break;
+        }
+    }
+    encoded
 }
 
 fn decode_i64(bytes: &[u8]) -> i64 {
