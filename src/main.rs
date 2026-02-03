@@ -150,18 +150,25 @@ fn decode_i64(bytes: &[u8]) -> i64 {
 }
 
 /// Extract printable ASCII strings (min_len or longer) from binary data.
+/// Skips 0xff bytes (memcomparable markers) between printable chars so
+/// encoded strings are reconstructed intact.
 fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<String> {
     let mut strings = Vec::new();
     let mut current = String::new();
-    for &b in data {
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
         if b >= 0x20 && b < 0x7f {
             current.push(b as char);
+        } else if b == 0xff && !current.is_empty() {
+            // memcomparable marker between printable chars - skip it
         } else {
             if current.len() >= min_len {
                 strings.push(current.clone());
             }
             current.clear();
         }
+        i += 1;
     }
     if current.len() >= min_len {
         strings.push(current);
