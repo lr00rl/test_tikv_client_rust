@@ -1,5 +1,5 @@
 use std::env;
-use tikv_client::RawClient;
+use tikv_client::{RawClient, TransactionClient};
 
 #[tokio::main]
 async fn main() {
@@ -9,6 +9,7 @@ async fn main() {
     let mut pd_endpoints = Vec::new();
     let mut table_id_filter: Option<i64> = None;
     let mut limit: u32 = 20;
+    let mut use_txn = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -20,69 +21,161 @@ async fn main() {
                 i += 1;
                 limit = args[i].parse().expect("--limit must be a number");
             }
+            "--txn" => {
+                use_txn = true;
+            }
             _ => pd_endpoints.push(args[i].clone()),
         }
         i += 1;
     }
 
     if pd_endpoints.is_empty() {
-        eprintln!("Usage: test_tikv_client <pd_addr> [--table-id <ID>] [--limit <N>]");
-        eprintln!("Example: test_tikv_client 10.0.12.184:2379 --table-id 11874 --limit 20");
+        eprintln!("Usage: test_tikv_client <pd_addr> [--table-id <ID>] [--limit <N>] [--txn]");
+        eprintln!("Example: test_tikv_client 10.0.12.184:2379 --table-id 11875 --limit 5 --txn");
         std::process::exit(1);
     }
 
-    println!("=== TiKV Scan Test (RawClient) ===");
+    let mode = if use_txn { "TransactionClient" } else { "RawClient" };
+    println!("=== TiKV Scan Test ({}) ===", mode);
     println!("PD endpoints: {:?}", pd_endpoints);
     if let Some(tid) = table_id_filter {
         println!("Filter: table_id={}", tid);
     }
     println!("Limit: {}\n", limit);
 
-    println!("Connecting to TiKV cluster...");
-    let client = RawClient::new(pd_endpoints)
-        .await
-        .expect("failed to connect");
-
-    println!("Connected successfully!\n");
-
     // Build scan range
+    // For --table-id, use the logical key directly (no memcomparable encoding).
+    // TiDB TransactionClient handles encoding internally.
+    // For RawClient, keys in storage have memcomparable encoding.
     let (start_key, end_key, range_desc) = if let Some(tid) = table_id_filter {
-        (encode_table_prefix(tid), encode_table_prefix(tid + 1), format!("table_id={}", tid))
+        if use_txn {
+            // TransactionClient: use logical key (no memcomparable)
+            let mut start = vec![b't'];
+            start.extend_from_slice(&encode_i64(tid));
+            let mut end = vec![b't'];
+            end.extend_from_slice(&encode_i64(tid + 1));
+            (start, end, format!("table_id={}", tid))
+        } else {
+            // RawClient: use memcomparable-encoded key
+            (encode_table_prefix(tid), encode_table_prefix(tid + 1), format!("table_id={}", tid))
+        }
     } else {
         (vec![b't'], vec![b'u'], "all tables".to_string())
     };
-    println!("Scanning {} keys for [{}]...", limit, range_desc);
 
-    match client.scan(start_key..end_key, limit).await {
-        Ok(pairs) => {
-            println!("Found {} key-value pairs:\n", pairs.len());
+    println!("start_key (hex): {}", bytes_to_hex(&start_key));
+    println!("end_key   (hex): {}", bytes_to_hex(&end_key));
+    println!();
 
-            for (i, kv) in pairs.iter().enumerate() {
-                let key_bytes: Vec<u8> = kv.0.clone().into();
-                let val_bytes: &[u8] = &kv.1;
+    if use_txn {
+        println!("Connecting (TransactionClient)...");
+        let txn_client = TransactionClient::new(pd_endpoints)
+            .await
+            .expect("failed to connect");
+        println!("Connected!\n");
 
-                println!("--- [{}] ---", i);
-                println!("  key (hex):  {}", bytes_to_hex(&key_bytes));
-                println!("  key (raw):  {:?}", key_bytes);
-                println!("  key (tidb): {}", decode_tidb_key(&key_bytes));
-                println!("  val (hex):  {}", bytes_to_hex(val_bytes));
-                println!("  val (len):  {} bytes", val_bytes.len());
+        let mut txn = txn_client.begin_optimistic().await.expect("failed to begin txn");
+        println!("Scanning {} keys for [{}]...", limit, range_desc);
 
-                // Show readable ASCII strings found in value
-                let readable = extract_ascii_strings(val_bytes, 4);
-                if !readable.is_empty() {
-                    println!("  val (strings): {}", readable.join(" | "));
+        match txn.scan(start_key..end_key, limit).await {
+            Ok(pairs) => {
+                let pairs: Vec<_> = pairs.collect();
+                println!("Found {} key-value pairs:\n", pairs.len());
+                for (i, kv) in pairs.iter().enumerate() {
+                    let key_bytes: Vec<u8> = kv.0.clone().into();
+                    let val_bytes: &[u8] = &kv.1;
+                    print_kv(i, &key_bytes, val_bytes, false);
                 }
-                println!();
+            }
+            Err(e) => {
+                eprintln!("Scan failed: {}", e);
+                std::process::exit(1);
             }
         }
-        Err(e) => {
-            eprintln!("Scan failed: {}", e);
-            std::process::exit(1);
+        let _ = txn.commit().await;
+    } else {
+        println!("Connecting (RawClient)...");
+        let client = RawClient::new(pd_endpoints)
+            .await
+            .expect("failed to connect");
+        println!("Connected!\n");
+
+        println!("Scanning {} keys for [{}]...", limit, range_desc);
+
+        match client.scan(start_key..end_key, limit).await {
+            Ok(pairs) => {
+                println!("Found {} key-value pairs:\n", pairs.len());
+                for (i, kv) in pairs.iter().enumerate() {
+                    let key_bytes: Vec<u8> = kv.0.clone().into();
+                    let val_bytes: &[u8] = &kv.1;
+                    print_kv(i, &key_bytes, val_bytes, true);
+                }
+            }
+            Err(e) => {
+                eprintln!("Scan failed: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 
     println!("=== Done ===");
+}
+
+fn print_kv(i: usize, key_bytes: &[u8], val_bytes: &[u8], raw_mode: bool) {
+    println!("--- [{}] ---", i);
+    println!("  key (hex):  {}", bytes_to_hex(key_bytes));
+    if raw_mode {
+        // RawClient returns memcomparable-encoded keys with MVCC suffix
+        println!("  key (tidb): {}", decode_tidb_key(key_bytes));
+    } else {
+        // TransactionClient returns logical keys directly
+        println!("  key (tidb): {}", decode_logical_key(key_bytes));
+    }
+    println!("  val (hex):  {}", bytes_to_hex(val_bytes));
+    println!("  val (len):  {} bytes", val_bytes.len());
+
+    let readable = extract_ascii_strings(val_bytes, 4);
+    if !readable.is_empty() {
+        println!("  val (strings): {}", readable.join(" | "));
+    }
+    println!();
+}
+
+/// Decode a logical TiDB key (no memcomparable encoding, as returned by TransactionClient).
+fn decode_logical_key(key: &[u8]) -> String {
+    if key.is_empty() || key[0] != b't' {
+        return format!("not a table key (hex: {})", bytes_to_hex(key));
+    }
+    if key.len() < 9 {
+        return format!("table key too short ({} bytes)", key.len());
+    }
+
+    let table_id = decode_i64(&key[1..9]);
+
+    if key.len() < 11 {
+        return format!("table_id={}", table_id);
+    }
+
+    let tag = &key[9..11];
+    match tag {
+        b"_r" => {
+            if key.len() >= 19 {
+                let row_id = decode_i64(&key[11..19]);
+                format!("table_id={}, record row_id={}", table_id, row_id)
+            } else {
+                format!("table_id={}, record (row_id truncated)", table_id)
+            }
+        }
+        b"_i" => {
+            if key.len() >= 19 {
+                let index_id = decode_i64(&key[11..19]);
+                format!("table_id={}, index_id={}", table_id, index_id)
+            } else {
+                format!("table_id={}, index (index_id truncated)", table_id)
+            }
+        }
+        _ => format!("table_id={}, unknown tag {:02x}{:02x}", table_id, tag[0], tag[1]),
+    }
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
